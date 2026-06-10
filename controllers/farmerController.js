@@ -1,6 +1,7 @@
 const Farmer = require('../models/farmer');
+const land = require('../models/land');
 const Land = require('../models/land')
-const generateFarmerId = require('../utils/generatedIds');
+const { getFarmerId, incrementFarmerId } = require('../utils/generatedIds');
 
 exports.createFarmer = async (req, res) => {
     try {
@@ -9,8 +10,15 @@ exports.createFarmer = async (req, res) => {
         if (!lands || !Array.isArray(lands) || lands.length === 0) {
             return res.status(400).json({ success: false, message: 'At least one land is required' });
         }
-        const farmerId = farmerData.farmerId || await generateFarmerId();
-        const farmer = await Farmer.create({ ...farmerData, farmerId });
+
+
+        await Promise.all(lands.map(land => new Land({ ...land, farmerId: 0 }).validate()));
+
+
+        const farmerId = farmerData.farmerId || await getFarmerId();
+        const farmer = await Farmer.create({ farmerId, ...farmerData });
+        await incrementFarmerId();
+
         const landRecords = lands.map((land) => {
             let landData = { farmerId, farmerType: land.farmerType };
 
@@ -36,7 +44,9 @@ exports.createFarmer = async (req, res) => {
 
             return landData;
         });
+
         const createdLands = await Land.insertMany(landRecords);
+
         res.status(201).json({
             success: true,
             data: { ...farmer.toObject(), lands: createdLands }
@@ -44,20 +54,17 @@ exports.createFarmer = async (req, res) => {
 
     } catch (error) {
         res.status(400).json({ success: false, message: error.message });
-
     }
-}
+};
 
 exports.getAllFarmers = async (req, res) => {
     try {
-        const { name, mobile, page = 1, limit = 10 } = req.query;
+        const { page = 1, limit = 10 } = req.query;
         let query = { isActive: true };
-        if (name) query.farmerName = { $regex: name, $options: 'i' };
-        if (mobile) query.mobileNumber = mobile
-        const skip = (page - 1) * limit;
+        const skip = (page - 1) * Number(limit);
         const total = await Farmer.countDocuments(query);
-        const farmers = await Farmer.find(query).skip(skip).limit(Number(limit));
         const farmersWithLands = await Farmer.aggregate([
+            { $match: query },
             {
                 $lookup: {
                     from: "lands",
@@ -67,10 +74,18 @@ exports.getAllFarmers = async (req, res) => {
                 }
             },
             {
-                $match: {
-                    "lands.isActive": true
+                $addFields: {
+                    lands: {
+                        $filter: {
+                            input: "$lands",
+                            as: "land",
+                            cond: { $eq: ["$$land.isActive", true] }
+                        }
+                    }
                 }
-            }
+            },
+            { $skip: skip },
+            { $limit: Number(limit) }
         ]);
 
         res.status(200).json({
@@ -80,6 +95,78 @@ exports.getAllFarmers = async (req, res) => {
             totalPages: Math.ceil(total / limit),
             data: farmersWithLands
         });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.searchFarmers = async (req, res) => {
+    try {
+        const { q, name, mobile, farmerId, page = 1, limit = 10 } = req.body;
+
+        const filter = { isActive: true };
+
+        if (name) {
+            filter.farmerName = { $regex: name.trim(), $options: 'i' };
+        }
+
+        if (mobile) {
+            filter.mobileNumber = { $regex: mobile.trim(), $options: 'i' };
+        }
+
+        if (farmerId) {
+            filter.$expr = {
+                $regexMatch: {
+                    input: { $toString: "$farmerId" },
+                    regex: String(farmerId).trim(),
+                    options: "i"
+                }
+            };
+        }
+
+        if (q && q.trim()) {
+            filter.$or = [
+                { farmerName: { $regex: q.trim(), $options: 'i' } },
+                { mobileNumber: { $regex: q.trim(), $options: 'i' } },
+                { $expr: { $regexMatch: { input: { $toString: "$farmerId" }, regex: q.trim() } } }
+            ];
+        }
+
+        const skip = (page - 1) * Number(limit);
+        const total = await Farmer.countDocuments(filter);
+        const results = await Farmer.aggregate([
+            { $match: filter },
+            {
+                $lookup: {
+                    from: "lands",
+                    localField: "farmerId",
+                    foreignField: "farmerId",
+                    as: "lands"
+                }
+            },
+            {
+                $addFields: {
+                    lands: {
+                        $filter: {
+                            input: "$lands",
+                            as: "land",
+                            cond: { $eq: ["$$land.isActive", true] }
+                        }
+                    }
+                }
+            },
+            { $skip: skip },
+            { $limit: Number(limit) }
+        ]);
+
+        res.json({
+            success: true,
+            data: results,
+            total,
+            page: Number(page),
+            totalPages: Math.ceil(total / Number(limit))
+        });
+
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -108,18 +195,28 @@ exports.getFarmerById = async (req, res) => {
     }
 };
 
-exports.updateFarmer = async (req, res) => {
+exports.updateFarmerWithLand = async (req, res) => {
     try {
         const { lands, ...farmerData } = req.body;
 
+        if (lands && Array.isArray(lands) && lands.length > 0) {
+            await Promise.all(lands.map(land => new Land(land).validate()));
+        }
         const farmer = await Farmer.findOneAndUpdate(
-            { farmerId: req.params.id, isActive: true },
+            { farmerId: Number(req.params.id), isActive: true },
             farmerData,
             { returnDocument: 'after', runValidators: true }
         );
         if (!farmer) return res.status(404).json({ success: false, message: 'Farmer not found' });
 
-        if (Array.isArray(lands) && lands.length > 0) {
+
+
+        if (lands && Array.isArray(lands) && lands.length > 0) {
+            const landIds = lands.filter(l => l._id).map(l => l._id);
+            await Land.updateMany(
+                { farmerId: farmer.farmerId, isActive: true, _id: { $nin: landIds } },
+                { $set: { isActive: false } }
+            );
             await Promise.all(
                 lands.map(async (land) => {
                     let landData = { farmerType: land.farmerType, generatedCrops: land.generatedCrops };
@@ -141,16 +238,13 @@ exports.updateFarmer = async (req, res) => {
                             leaseAgreementProof: land.leaseAgreementProof
                         };
                     }
-
+                    const unsetFields = land.farmerType === 'Owner'
+                        ? { landAcquiredArea: '', landAcquiredUnit: '', leaseAgreementProof: '' }
+                        : { landholdingSize: '', landholdingUnit: '', landOwnershipProof: '' };
                     if (land._id) {
-                        const unsetFields =
-                            land.farmerType === 'Owner'
-                                ? { landAcquiredArea: '', landAcquiredUnit: '', leaseAgreementProof: '' }
-                                : { landholdingSize: '', landholdingUnit: '', landOwnershipProof: '' };
-
-                        await Land.findByIdAndUpdate(
-                            land._id,
-                            { ...landData, $unset: unsetFields },
+                        await Land.findOneAndUpdate(
+                            { _id: land._id, farmerId: farmer.farmerId, isActive: true },
+                            { $set: landData, $unset: unsetFields },
                             { returnDocument: 'after', runValidators: true }
                         );
                     } else {
@@ -159,9 +253,12 @@ exports.updateFarmer = async (req, res) => {
                 })
             );
         }
-
         const updatedLands = await Land.find({ farmerId: farmer.farmerId, isActive: true });
-        res.status(200).json({ success: true, data: { ...farmer.toObject(), lands: updatedLands } });
+
+        res.status(200).json({
+            success: true,
+            data: { ...farmer.toObject(), lands: updatedLands }
+        });
     } catch (error) {
         res.status(400).json({ success: false, message: error.message });
     }
@@ -176,8 +273,7 @@ exports.deleteFarmer = async (req, res) => {
             { returnDocument: 'after' }
         );
         if (!farmer) return res.status(404).json({ success: false, message: 'Farmer not found' });
-        await Land.updateMany({ farmerId: req.params.id }, { isActive: false });
-
+        await Land.updateMany({ farmerId: Number(req.params.id) }, { isActive: false });
         res.status(200).json({ success: true, message: 'Farmer deleted successfully' });
 
     } catch (error) {
@@ -185,4 +281,5 @@ exports.deleteFarmer = async (req, res) => {
 
     }
 
-}
+};
+

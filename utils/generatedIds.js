@@ -1,12 +1,17 @@
 const Counter = require('../models/counter');
 
-const generateFarmerId = async () => {
-  const counter = await Counter.findOneAndUpdate(
-    { name: 'farmerId' },
-    { $inc: { seq: 1 } },
-    { returnDocument: 'after', upsert: true }
-  );
-  return 1000 + counter.seq;
+const getFarmerId = async () => {
+  const counter = await Counter.findOne({ name: 'farmerId' });
+  return 1000 + ((counter?.seq || 0) + 1);
 };
 
-module.exports = generateFarmerId;
+const incrementFarmerId = async () => {
+  await Counter.findOneAndUpdate(
+    { name: 'farmerId' },
+    { $inc: { seq: 1 } },
+    { upsert: true }
+  );
+};
+
+
+module.exports = { getFarmerId, incrementFarmerId };
